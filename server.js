@@ -1,325 +1,205 @@
 'use strict';
 
-// GSN Friend Pass API — Node.js 20+ / Render
-// Install: npm install express
-// Start: node server.js
+// GSN Friend Pass Backend — Node.js 20+
+// Render start command: npm start
 
-const express = require('express');
-const app = express();
-app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+const http = require('node:http');
+const { URL } = require('node:url');
 
 const PORT = Number(process.env.PORT || 3000);
-const ROBLOX_TIMEOUT_MS = 12000;
+const VERSION = '4.0.0';
+const TIMEOUT_MS = 15000;
 const MAX_GAMES = 50;
 const MAX_PASSES = 100;
+const MAX_PASS_PAGES_PER_GAME = 3;
 
-async function robloxJSON(url) {
+function json(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(payload);
+}
+
+async function fetchJson(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ROBLOX_TIMEOUT_MS);
-
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
     const response = await fetch(url, {
-      method: 'GET',
+      ...options,
       signal: controller.signal,
       headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'GSN-FriendPass/2.0 (Roblox experience backend)'
+        Accept: 'application/json',
+        'User-Agent': 'GSN-FriendPass/4.0',
+        ...(options.headers || {})
       }
     });
-
-    const body = await response.text();
-    let json;
-
-    try {
-      json = body ? JSON.parse(body) : {};
-    } catch {
-      throw new Error(`Roblox returned invalid JSON (HTTP ${response.status})`);
-    }
-
+    const raw = await response.text();
+    let data;
+    try { data = raw ? JSON.parse(raw) : {}; }
+    catch { throw new Error(`Roblox returned invalid JSON (HTTP ${response.status}).`); }
     if (!response.ok) {
-      const detail =
-        json?.errors?.[0]?.message ||
-        json?.message ||
-        `HTTP ${response.status}`;
-
-      const error = new Error(`Roblox API: ${detail}`);
-      error.status = response.status;
-      throw error;
+      const message = data?.errors?.[0]?.message || data?.message || `HTTP ${response.status}`;
+      throw new Error(`Roblox API: ${message}`);
     }
-
-    return json;
+    return data;
   } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error('انتهت مهلة الاتصال بخوادم Roblox. حاول مرة أخرى.');
-    }
+    if (error.name === 'AbortError') throw new Error('انتهت مهلة الاتصال بخوادم Roblox. حاول مرة أخرى.');
     throw error;
   } finally {
     clearTimeout(timer);
   }
 }
 
-const clean = value => String(value ?? '').trim();
-
-const numberId = value =>
-  Number.isSafeInteger(Number(value)) && Number(value) > 0;
-
-async function findUser(username) {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    ROBLOX_TIMEOUT_MS
-  );
-
-  let result;
-
-  try {
-    const response = await fetch(
-      'https://users.roblox.com/v1/usernames/users',
-      {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          usernames: [username],
-          excludeBannedUsers: false
-        })
-      }
-    );
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(
-        data?.errors?.[0]?.message ||
-        `تعذر البحث عن الحساب (HTTP ${response.status}).`
-      );
-    }
-
-    result = data;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  const user = result?.data?.[0];
-
-  if (!user?.id) {
-    throw new Error(
-      'لم يتم العثور على اسم المستخدم. تأكد من كتابته بشكل صحيح.'
-    );
-  }
-
+async function resolveUser(username) {
+  const data = await fetchJson('https://users.roblox.com/v1/usernames/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ usernames: [username], excludeBannedUsers: false })
+  });
+  const user = data?.data?.[0];
+  if (!user?.id) throw new Error('لم يتم العثور على اسم المستخدم. تأكد من كتابته بشكل صحيح.');
   return {
-    id: Number(user.id),
+    userId: Number(user.id),
     username: user.name || username,
     displayName: user.displayName || user.name || username
   };
 }
 
-async function getPublicGames(userId) {
+async function getUserGames(userId) {
   const games = [];
   let cursor = '';
-
-  for (
-    let page = 0;
-    page < 2 && games.length < MAX_GAMES;
-    page++
-  ) {
-    const params = new URLSearchParams({
-      accessFilter: 'Public',
-      limit: '50',
-      sortOrder: 'Asc'
-    });
-
-    if (cursor) {
-      params.set('cursor', cursor);
-    }
-
-    const data = await robloxJSON(
-      `https://games.roblox.com/v2/users/${userId}/games?${params}`
-    );
-
-    for (const game of (data.data || [])) {
-      if (numberId(game.id)) {
-        games.push({
-          id: Number(game.id),
-          name: clean(game.name) || 'Experience'
-        });
+  for (let page = 0; page < 2 && games.length < MAX_GAMES; page++) {
+    const query = new URLSearchParams({ accessFilter: 'Public', limit: '50', sortOrder: 'Asc' });
+    if (cursor) query.set('cursor', cursor);
+    const data = await fetchJson(`https://games.roblox.com/v2/users/${userId}/games?${query}`);
+    for (const game of data.data || []) {
+      const universeId = Number(game.id);
+      if (Number.isSafeInteger(universeId) && universeId > 0) {
+        games.push({ universeId, gameName: String(game.name || 'Experience') });
       }
-
       if (games.length >= MAX_GAMES) break;
     }
-
     cursor = data.nextPageCursor || '';
-
     if (!cursor) break;
   }
-
   return games;
 }
 
-async function getGamePasses(universeId, gameName) {
-  const params = new URLSearchParams({
-    passView: 'Full',
-    pageSize: '100'
-  });
-
-  const data = await robloxJSON(
-    `https://apis.roblox.com/game-passes/v1/universes/${universeId}/game-passes?${params}`
-  );
-
-  const list =
-    data.gamePasses ||
-    data.data ||
-    data.passes ||
-    [];
-
-  return list
-    .map(pass => ({
-      id: Number(pass.id || pass.gamePassId),
-      name: clean(pass.name || pass.displayName) || 'Game Pass',
-      price:
-        Number.isFinite(Number(pass.price)) &&
-        pass.price !== null
-          ? Number(pass.price)
-          : null,
-      gameName
-    }))
-    .filter(pass => numberId(pass.id));
+async function getPassesForGame(game) {
+  const passes = [];
+  let pageToken = '';
+  for (let page = 0; page < MAX_PASS_PAGES_PER_GAME && passes.length < MAX_PASSES; page++) {
+    const query = new URLSearchParams({ passView: 'Full', pageSize: '100' });
+    if (pageToken) query.set('pageToken', pageToken);
+    const data = await fetchJson(
+      `https://apis.roblox.com/game-passes/v1/universes/${game.universeId}/game-passes?${query}`
+    );
+    const rows = data.gamePasses || data.data || data.passes || [];
+    for (const row of rows) {
+      const id = Number(row.id || row.gamePassId);
+      if (!Number.isSafeInteger(id) || id <= 0) continue;
+      const rawPrice = row.price;
+      const price = rawPrice === null || rawPrice === undefined || rawPrice === '' ? null : Number(rawPrice);
+      passes.push({
+        id,
+        name: String(row.name || row.displayName || 'Game Pass'),
+        price: Number.isFinite(price) ? price : null,
+        gameName: game.gameName,
+        gameUrl: `https://www.roblox.com/games/${game.universeId}`,
+        buyUrl: `https://www.roblox.com/game-pass/${id}`
+      });
+      if (passes.length >= MAX_PASSES) break;
+    }
+    pageToken = data.nextPageToken || data.nextPageCursor || '';
+    if (!pageToken || rows.length === 0) break;
+  }
+  return passes;
 }
 
-async function getImages(passes) {
-  if (!passes.length) {
-    return new Map();
-  }
-
-  const ids = passes.map(pass => pass.id).join(',');
-
-  const data = await robloxJSON(
-    `https://thumbnails.roblox.com/v1/game-passes?gamePassIds=${encodeURIComponent(ids)}&size=150x150&format=Png&isCircular=false`
-  );
-
+async function getThumbnails(passes) {
   const map = new Map();
-
-  for (const item of (data.data || [])) {
-    if (item.targetId && item.imageUrl) {
-      map.set(Number(item.targetId), item.imageUrl);
+  // Roblox thumbnail endpoint accepts a list of IDs. Batch to keep URLs manageable.
+  for (let i = 0; i < passes.length; i += 50) {
+    const batch = passes.slice(i, i + 50);
+    const ids = batch.map(pass => pass.id).join(',');
+    const data = await fetchJson(
+      `https://thumbnails.roblox.com/v1/game-passes?gamePassIds=${encodeURIComponent(ids)}&size=150x150&format=Png&isCircular=false`
+    );
+    for (const item of data.data || []) {
+      if (item.targetId && item.imageUrl) map.set(Number(item.targetId), item.imageUrl);
     }
   }
-
   return map;
 }
 
-async function searchFriend(username) {
-  const user = await findUser(username);
-  const games = await getPublicGames(user.id);
+async function search(username) {
+  const user = await resolveUser(username);
+  const games = await getUserGames(user.userId);
+  const collected = [];
 
-  if (!games.length) {
-    return {
-      user,
-      gamesChecked: 0,
-      passes: []
-    };
-  }
-
-  const all = [];
-
-  for (let i = 0; i < games.length; i += 5) {
-    const batch = games.slice(i, i + 5);
-
-    const results = await Promise.allSettled(
-      batch.map(game =>
-        getGamePasses(game.id, game.name)
-      )
-    );
-
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        all.push(...result.value);
-      }
+  // Small batches avoid overwhelming Roblox's public API.
+  for (let i = 0; i < games.length; i += 4) {
+    const batch = games.slice(i, i + 4);
+    const settled = await Promise.allSettled(batch.map(getPassesForGame));
+    for (const result of settled) {
+      if (result.status === 'fulfilled') collected.push(...result.value);
+      else console.warn("[GSN] One game passes could not be loaded:", result.reason?.message);
     }
   }
 
-  const unique = [
-    ...new Map(
-      all.map(pass => [pass.id, pass])
-    ).values()
-  ].slice(0, MAX_PASSES);
-
-  let images = new Map();
-
-  try {
-    images = await getImages(unique);
-  } catch (error) {
-    console.warn('[thumbnails]', error.message);
+  const unique = [...new Map(collected.map(pass => [pass.id, pass])).values()].slice(0, MAX_PASSES);
+  let thumbnails = new Map();
+  if (unique.length) {
+    try { thumbnails = await getThumbnails(unique); }
+    catch (error) { console.warn('[GSN] Thumbnail lookup failed:', error.message); }
   }
 
-  const passes = unique.map(pass => ({
-    ...pass,
-    imageUrl: images.get(pass.id) || ''
-  }));
-
+  const passes = unique.map(pass => ({ ...pass, imageUrl: thumbnails.get(pass.id) || '' }));
   return {
-    user,
+    user: { userId: user.userId, username: user.username, displayName: user.displayName },
     gamesChecked: games.length,
     passes
   };
 }
 
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'GSN Friend Pass API',
-    version: '2.0',
-    health: '/health',
-    search: '/search?username=RobloxName'
-  });
-});
+const server = http.createServer(async (req, res) => {
+  const base = `http://${req.headers.host || 'localhost'}`;
+  const url = new URL(req.url, base);
 
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'GSN Friend Pass API',
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/search', async (req, res) => {
-  const username = clean(req.query.username);
-
-  if (
-    !username ||
-    username.length > 20 ||
-    !/^[A-Za-z0-9_]+$/.test(username)
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: 'اكتب اسم Roblox صحيحاً (من 1 إلى 20 حرفاً أو رقماً).'
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
     });
+    return res.end();
   }
 
-  try {
-    const data = await searchFriend(username);
-
-    return res.json({
-      ok: true,
-      data
-    });
-  } catch (error) {
-    console.error('[search]', username, error);
-
-    return res.status(502).json({
-      ok: false,
-      error: error.message || 'حدث خطأ أثناء البحث.'
-    });
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+    return json(res, 200, { ok: true, service: 'GSN Friend Pass API', version: VERSION });
   }
+
+  if (req.method === 'GET' && url.pathname === '/search') {
+    const username = String(url.searchParams.get('username') || '').trim();
+    if (!/^[A-Za-z0-9_]{1,20}$/.test(username)) {
+      return json(res, 400, { ok: false, error: 'اكتب اسم Roblox صحيحاً (من 1 إلى 20 حرفاً أو رقماً).' });
+    }
+    try {
+      const data = await search(username);
+      return json(res, 200, { ok: true, data });
+    } catch (error) {
+      console.error('[GSN search]', username, error);
+      return json(res, 502, { ok: false, error: error.message || 'حدث خطأ أثناء البحث.' });
+    }
+  }
+
+  return json(res, 404, { ok: false, error: 'المسار غير موجود.' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `GSN Friend Pass API listening on ${PORT}`
-  );
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[GSN] Friend Pass API v${VERSION} listening on ${PORT}`);
 });
